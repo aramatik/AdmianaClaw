@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  ai-bot:
+    build: .
+    container_name: my_ai_admin
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Наш портал: папка на сервере = папка в контейнере
+      - /root/ai_files:/app/downloads
+    environment:
+      - TG_TOKEN=${TG_TOKEN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI2_API_KEY=${GEMINI2_API_KEY}
+      - GEMINI3_API_KEY=${GEMINI3_API_KEY}
+      - ADMIN_ID=${ADMIN_ID}
+      - ADMIN2_ID=${ADMIN2_ID}
+      - ADMIN3_ID=${ADMIN3_ID}
