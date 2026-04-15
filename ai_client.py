@@ -34,6 +34,7 @@ class AIManager:
         self.model_tpm_limits = {}
         self.model_rpd_limits = {}
         self.priority_models = []
+        self.other_models = []
         self.prompts = {}
         
         # Хранилище состояний
@@ -54,6 +55,25 @@ class AIManager:
         self._load_configs()
         self._load_limits_state()
 
+    def _clean_schema(self, schema_dict):
+        """Рекурсивно удаляет поля из JSON-схемы, которые не поддерживает API Gemini"""
+        if not isinstance(schema_dict, dict):
+            return schema_dict
+            
+        # Удаляем поля, из-за которых падает "Unknown field for Schema"
+        schema_dict.pop("title", None)
+        schema_dict.pop("default", None)
+        schema_dict.pop("additionalProperties", None)
+        
+        for key, value in schema_dict.items():
+            if isinstance(value, dict):
+                self._clean_schema(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        self._clean_schema(item)
+        return schema_dict
+
     async def connect_mcp(self):
         """Поднимает MCP сервер как подпроцесс и забирает список доступных инструментов"""
         server_script = os.path.join(os.path.dirname(__file__), "mcp_server.py")
@@ -73,10 +93,14 @@ class AIManager:
         gemini_funcs = []
         
         for tool in mcp_tools_response.tools:
+            # Обязательно очищаем схему перед отправкой в Gemini
+            schema = tool.inputSchema.copy() if tool.inputSchema else {}
+            self._clean_schema(schema)
+            
             gemini_funcs.append({
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.inputSchema
+                "parameters": schema
             })
             
         self.gemini_tools = [{"function_declarations": gemini_funcs}]
@@ -87,8 +111,22 @@ class AIManager:
         await self.mcp_exit_stack.aclose()
 
     # ---------------------------------------------------------
-    # ЛОГИКА ЛИМИТОВ И КОНФИГОВ (Перенесено из bot.py)
+    # ЛОГИКА ЛИМИТОВ, КЛЮЧЕЙ И КОНФИГОВ
     # ---------------------------------------------------------
+    def reload_configs(self):
+        """Перезагрузка конфигов для команды /reload"""
+        self._load_configs()
+        return len(self.priority_models), list(self.prompts.keys())
+
+    def set_active_key(self, key_num):
+        """Смена ключа для команды /changekey"""
+        if self.api_keys.get(key_num):
+            self.current_key_num = key_num
+            genai.configure(api_key=self.api_keys[key_num])
+            self.active_chats.clear() # Сбрасываем сессии при смене ключа
+            return True
+        return False
+
     def _load_configs(self):
         self.prompts.clear()
         if os.path.exists(PROMPTS_FILE):
@@ -105,6 +143,10 @@ class AIManager:
                 if current_key: self.prompts[current_key] = "\n".join(current_text).strip()
 
         self.priority_models.clear()
+        self.model_rpm_limits.clear()
+        self.model_tpm_limits.clear()
+        self.model_rpd_limits.clear()
+        
         if os.path.exists(MODELS_FILE):
             with open(MODELS_FILE, "r", encoding="utf-8") as f:
                 for line in f:
@@ -194,7 +236,6 @@ class AIManager:
             self.active_chats[chat_id] = model.start_chat()
         else:
             sys_prompt = self.prompts.get("GEMINI_ADMIN", "") + "\n\n[IMPORTANT] Return EXACTLY ONE tool call per response."
-            # Передаем схему инструментов от MCP
             model = genai.GenerativeModel(
                 model_name=model_name,
                 tools=self.gemini_tools,
@@ -204,7 +245,6 @@ class AIManager:
 
     async def execute_mcp_tool(self, tool_name: str, args: dict, chat_id: int) -> str:
         """Проксирует вызов инструмента в MCP сервер"""
-        # Инжектим chat_id, если он требуется для задач
         if tool_name in ["delete_scheduled_task_tool", "list_my_tasks_tool"]:
             args["chat_id"] = chat_id
             
@@ -225,13 +265,9 @@ class AIManager:
         
         self.check_api_rate_limit(model_name)
         
-        # Отправляем сообщение асинхронно через executor, так как SDK Gemini синхронный
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(None, chat.send_message, user_text)
 
-        # -----------------------------------------------------
-        # ОБРАБОТКА GEMMA (Regex парсинг)
-        # -----------------------------------------------------
         if is_gemma:
             response_text = response.text or ""
             action = None
@@ -251,23 +287,16 @@ class AIManager:
                 return await self.process_message(chat_id, followup_prompt, update_status_cb)
             return response_text
 
-        # -----------------------------------------------------
-        # ОБРАБОТКА GEMINI (Native Function Calling Loop)
-        # -----------------------------------------------------
         while response.function_call:
             fc = response.function_call
             tool_name = fc.name
-            
-            # Извлекаем аргументы из Protobuf объекта
             tool_args = type(fc).to_dict(fc).get("args", {})
             
             if update_status_cb: 
                 await update_status_cb(f"⚙️ Выполняю: <b>{tool_name}</b>")
             
-            # 1. Вызываем инструмент через MCP
             result_text = await self.execute_mcp_tool(tool_name, tool_args, chat_id)
             
-            # Возвращаем маркер загрузки файла обратно клиенту телеграма (если нужно)
             if result_text.startswith("__MCP_SEND_FILE_TRIGGER__"):
                 return result_text 
             
@@ -276,7 +305,6 @@ class AIManager:
                 
             self.check_api_rate_limit(model_name)
             
-            # 2. Возвращаем результат обратно в Gemini
             func_response = {
                 "function_response": {
                     "name": tool_name,
@@ -286,4 +314,4 @@ class AIManager:
             response = await loop.run_in_executor(None, chat.send_message, func_response)
 
         return response.text
-      
+        
