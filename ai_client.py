@@ -18,7 +18,6 @@ MODELS_FILE = "models.txt"
 
 class AIManager:
     def __init__(self):
-        # Ключи и инициализация
         self.api_keys = {
             1: os.getenv("GEMINI_API_KEY"),
             2: os.getenv("GEMINI2_API_KEY"),
@@ -28,26 +27,21 @@ class AIManager:
         if self.api_keys[self.current_key_num]:
             genai.configure(api_key=self.api_keys[self.current_key_num])
 
-        # Лимиты и конфигурации
         self.model_rpm_limits = {}
         self.model_restricted_keys = {}
         self.model_tpm_limits = {}
         self.model_rpd_limits = {}
         self.priority_models = []
-        self.other_models = []
         self.prompts = {}
         
-        # Хранилище состояний
         self.api_rpd_history = {1: {"date": "", "usage": {}}, 2: {"date": "", "usage": {}}, 3: {"date": "", "usage": {}}}
         self.api_request_history = {1: deque(), 2: deque(), 3: deque()}
         self.api_token_history = {1: deque(), 2: deque(), 3: deque()}
         
-        # Активные сессии
-        self.active_chats = {}       # chat_id -> genai.ChatSession
-        self.chat_models = {}        # chat_id -> model_name
-        self.chat_roles = {}         # chat_id -> role
+        self.active_chats = {}       
+        self.chat_models = {}        
+        self.chat_roles = {}         
         
-        # MCP Клиент
         self.mcp_session = None
         self.mcp_exit_stack = AsyncExitStack()
         self.gemini_tools = []
@@ -56,15 +50,12 @@ class AIManager:
         self._load_limits_state()
 
     def _clean_schema(self, schema_dict):
-        """Рекурсивно удаляет поля из JSON-схемы, которые не поддерживает API Gemini"""
+        """Очищает JSON-схему от полей, которые крашат Gemini API"""
         if not isinstance(schema_dict, dict):
             return schema_dict
-            
-        # Удаляем поля, из-за которых падает "Unknown field for Schema"
         schema_dict.pop("title", None)
         schema_dict.pop("default", None)
         schema_dict.pop("additionalProperties", None)
-        
         for key, value in schema_dict.items():
             if isinstance(value, dict):
                 self._clean_schema(value)
@@ -75,12 +66,8 @@ class AIManager:
         return schema_dict
 
     async def connect_mcp(self):
-        """Поднимает MCP сервер как подпроцесс и забирает список доступных инструментов"""
         server_script = os.path.join(os.path.dirname(__file__), "mcp_server.py")
-        server_params = StdioServerParameters(
-            command="python",
-            args=[server_script]
-        )
+        server_params = StdioServerParameters(command="python", args=[server_script])
         
         stdio_transport = await self.mcp_exit_stack.enter_async_context(stdio_client(server_params))
         read, write = stdio_transport
@@ -88,15 +75,12 @@ class AIManager:
         self.mcp_session = await self.mcp_exit_stack.enter_async_context(ClientSession(read, write))
         await self.mcp_session.initialize()
         
-        # Запрашиваем инструменты у MCP сервера
         mcp_tools_response = await self.mcp_session.list_tools()
         gemini_funcs = []
         
         for tool in mcp_tools_response.tools:
-            # Обязательно очищаем схему перед отправкой в Gemini
             schema = tool.inputSchema.copy() if tool.inputSchema else {}
             self._clean_schema(schema)
-            
             gemini_funcs.append({
                 "name": tool.name,
                 "description": tool.description,
@@ -106,26 +90,28 @@ class AIManager:
         self.gemini_tools = [{"function_declarations": gemini_funcs}]
         print(f"[MCP] Успешно подключено. Загружено инструментов: {len(gemini_funcs)}")
 
-    async def disconnect_mcp(self):
-        """Корректное завершение работы с MCP"""
-        await self.mcp_exit_stack.aclose()
-
-    # ---------------------------------------------------------
-    # ЛОГИКА ЛИМИТОВ, КЛЮЧЕЙ И КОНФИГОВ
-    # ---------------------------------------------------------
     def reload_configs(self):
-        """Перезагрузка конфигов для команды /reload"""
         self._load_configs()
         return len(self.priority_models), list(self.prompts.keys())
 
     def set_active_key(self, key_num):
-        """Смена ключа для команды /changekey"""
         if self.api_keys.get(key_num):
             self.current_key_num = key_num
             genai.configure(api_key=self.api_keys[key_num])
-            self.active_chats.clear() # Сбрасываем сессии при смене ключа
+            self.active_chats.clear() 
             return True
         return False
+
+    def get_limits_stats(self):
+        now = time.time()
+        history_rpm = self.api_request_history[self.current_key_num]
+        valid_rpm = [t for t in history_rpm if now - t <= 60.5]
+        history_tpm = self.api_token_history[self.current_key_num]
+        valid_tpm = sum(count for t, count in history_tpm if now - t <= 60.5)
+        
+        today_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+        key_data = self.api_rpd_history.get(self.current_key_num, {"date": today_str, "usage": {}})
+        return len(valid_rpm), valid_tpm, key_data.get("usage", {})
 
     def _load_configs(self):
         self.prompts.clear()
@@ -171,7 +157,6 @@ class AIManager:
                     data = json.load(f)
                     for k, v in data.items(): self.api_rpd_history[int(k)] = v
             except: pass
-        
         today_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
         for i in [1, 2, 3]:
             if i not in self.api_rpd_history or self.api_rpd_history[i].get("date") != today_str:
@@ -183,6 +168,10 @@ class AIManager:
             with open(LIMITS_STATE_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.api_rpd_history, f, ensure_ascii=False, indent=4)
         except: pass
+
+    def track_token_usage(self, token_count):
+        if token_count: 
+            self.api_token_history[self.current_key_num].append((time.time(), token_count))
 
     def check_api_rate_limit(self, model_name):
         clean_name = model_name.replace('models/', '')
@@ -209,22 +198,17 @@ class AIManager:
             next_key = keys[(idx + i) % 3]
             target_key = self.api_keys.get(next_key)
             if not target_key: continue
-            
             rpd_limit = self.model_rpd_limits.get(clean_name)
             if rpd_limit:
                 today_str = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
                 key_data = self.api_rpd_history.get(next_key, {"date": today_str, "usage": {}})
                 if key_data["date"] == today_str and key_data["usage"].get(clean_name, 0) >= rpd_limit:
                     continue
-            
             self.current_key_num = next_key
             genai.configure(api_key=target_key)
             return True
-        raise Exception("Все доступные ключи исчерпали дневной лимит (RPD) для этой модели.")
+        raise Exception("Все ключи исчерпали дневной лимит (RPD) для этой модели.")
 
-    # ---------------------------------------------------------
-    # УПРАВЛЕНИЕ СЕССИЯМИ И ВЫПОЛНЕНИЕ ЗАПРОСОВ
-    # ---------------------------------------------------------
     def init_chat(self, chat_id, model_name, role="admin"):
         self.chat_models[chat_id] = model_name
         self.chat_roles[chat_id] = role
@@ -236,26 +220,19 @@ class AIManager:
             self.active_chats[chat_id] = model.start_chat()
         else:
             sys_prompt = self.prompts.get("GEMINI_ADMIN", "") + "\n\n[IMPORTANT] Return EXACTLY ONE tool call per response."
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                tools=self.gemini_tools,
-                system_instruction=sys_prompt
-            )
+            model = genai.GenerativeModel(model_name=model_name, tools=self.gemini_tools, system_instruction=sys_prompt)
             self.active_chats[chat_id] = model.start_chat(enable_automatic_function_calling=False)
 
     async def execute_mcp_tool(self, tool_name: str, args: dict, chat_id: int) -> str:
-        """Проксирует вызов инструмента в MCP сервер"""
         if tool_name in ["delete_scheduled_task_tool", "list_my_tasks_tool"]:
             args["chat_id"] = chat_id
-            
         try:
             mcp_result = await self.mcp_session.call_tool(tool_name, arguments=args)
             return mcp_result.content[0].text if mcp_result.content else "Success (No output)"
         except Exception as e:
             return f"Error executing tool {tool_name}: {str(e)}"
 
-    async def process_message(self, chat_id: int, user_text: str, update_status_cb=None):
-        """Основной цикл обработки сообщений и инструментов"""
+    async def process_message(self, chat_id: int, prompt_parts, update_status_cb=None, check_abort_cb=None, semi_auto_cb=None, action_log_cb=None, stat_cb=None):
         if chat_id not in self.active_chats:
             raise Exception("Модель не выбрана. Используйте /gemini")
 
@@ -266,12 +243,15 @@ class AIManager:
         self.check_api_rate_limit(model_name)
         
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, chat.send_message, user_text)
+        response = await loop.run_in_executor(None, chat.send_message, prompt_parts)
+
+        if hasattr(response, 'usage_metadata') and stat_cb:
+            stat_cb(chat_id, response.usage_metadata.total_token_count)
+            self.track_token_usage(response.usage_metadata.total_token_count)
 
         if is_gemma:
             response_text = response.text or ""
             action = None
-            
             bash_match = re.search(r'<BASH>(.*?)</BASH>', response_text, re.DOTALL | re.IGNORECASE)
             search_match = re.search(r'<SEARCH>(.*?)</SEARCH>', response_text, re.DOTALL | re.IGNORECASE)
             sleep_match = re.search(r'<SLEEP>(.*?)</SLEEP>', response_text, re.DOTALL | re.IGNORECASE)
@@ -281,37 +261,47 @@ class AIManager:
             elif sleep_match: action = ("sleep_tool", {"seconds": int(sleep_match.group(1).strip() or 5)})
                 
             if action:
+                if check_abort_cb and await check_abort_cb(chat_id): return "🛑 Выполнение прервано."
+                if action_log_cb: await action_log_cb(chat_id, action[0], str(action[1]))
                 if update_status_cb: await update_status_cb(f"⚙️ Выполняю (Gemma): {action[0]}")
                 result = await self.execute_mcp_tool(action[0], action[1], chat_id)
                 followup_prompt = f"РЕЗУЛЬТАТ ВЫПОЛНЕНИЯ ({action[0]}):\n{result}\nДай финальный ответ или вызови новый тег."
-                return await self.process_message(chat_id, followup_prompt, update_status_cb)
+                return await self.process_message(chat_id, followup_prompt, update_status_cb, check_abort_cb, semi_auto_cb, action_log_cb, stat_cb)
             return response_text
 
         while response.function_call:
+            if check_abort_cb and await check_abort_cb(chat_id):
+                return "🛑 Выполнение принудительно остановлено."
+
             fc = response.function_call
             tool_name = fc.name
             tool_args = type(fc).to_dict(fc).get("args", {})
             
-            if update_status_cb: 
-                await update_status_cb(f"⚙️ Выполняю: <b>{tool_name}</b>")
+            if action_log_cb: await action_log_cb(chat_id, tool_name, str(tool_args))
+            
+            # Поддержка ПОЛУАВТОМАТА
+            if semi_auto_cb:
+                approved = await semi_auto_cb(chat_id, tool_name, tool_args)
+                if not approved:
+                    func_response = {"function_response": {"name": tool_name, "response": {"result": "ERROR: User denied permission."}}}
+                    response = await loop.run_in_executor(None, chat.send_message, func_response)
+                    continue
+
+            if update_status_cb: await update_status_cb(f"⚙️ Выполняю: <b>{tool_name}</b>")
             
             result_text = await self.execute_mcp_tool(tool_name, tool_args, chat_id)
             
             if result_text.startswith("__MCP_SEND_FILE_TRIGGER__"):
                 return result_text 
             
-            if update_status_cb: 
-                await update_status_cb("🧠 Анализирую результат...")
-                
+            if update_status_cb: await update_status_cb("🧠 Анализирую результат...")
             self.check_api_rate_limit(model_name)
             
-            func_response = {
-                "function_response": {
-                    "name": tool_name,
-                    "response": {"result": result_text}
-                }
-            }
+            func_response = {"function_response": {"name": tool_name, "response": {"result": result_text}}}
             response = await loop.run_in_executor(None, chat.send_message, func_response)
+            
+            if hasattr(response, 'usage_metadata') and stat_cb:
+                stat_cb(chat_id, response.usage_metadata.total_token_count)
+                self.track_token_usage(response.usage_metadata.total_token_count)
 
         return response.text
-        
